@@ -155,18 +155,11 @@ export function computeExportDimensions(
   return { width: w, height: h };
 }
 
-// =========== 编码后端抽象层 ===========
-// 优先使用 WebCodecs (VideoEncoder + mp4-muxer)，当不可用时回退到 MediaRecorder
-
-/** 检测 WebCodecs VideoEncoder 是否可用（Chrome 要求安全上下文） */
-function isWebCodecsAvailable(): boolean {
-  return typeof VideoEncoder === "function" && typeof VideoFrame === "function";
-}
+// =========== 编码后端（WebCodecs + mp4-muxer）===========
 
 /**
- * 编码后端统一接口
- * - WebCodecs 后端：精确控帧、时间戳精准、输出 MP4
- * - MediaRecorder 后端：兼容性好、HTTP 下也可用、输出 WebM
+ * 编码后端接口（仅 WebCodecs 实现）
+ * 精确控帧、时间戳精准、输出 MP4
  */
 interface EncoderBackend {
   /** 编码一帧（canvas 当前内容） */
@@ -266,107 +259,24 @@ function createWebCodecsBackend(
   };
 }
 
-/** 创建 MediaRecorder 编码后端 (WebM) — 不依赖 WebCodecs，HTTP 下也可用 */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function createMediaRecorderBackend(
-  canvas: HTMLCanvasElement,
-  _fps: number,
-  bitrate: number,
-): EncoderBackend {
-  const stream = canvas.captureStream(0); // fps=0 表示手动控帧
-  const chunks: Blob[] = [];
-
-  // 选择可用的 MIME 类型
-  const mimeTypes = [
-    "video/webm;codecs=h264",
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm",
-  ];
-  let selectedMime = "video/webm";
-  for (const mime of mimeTypes) {
-    if (MediaRecorder.isTypeSupported(mime)) {
-      selectedMime = mime;
-      break;
-    }
-  }
-
-  const recorder = new MediaRecorder(stream, {
-    mimeType: selectedMime,
-    videoBitsPerSecond: bitrate,
-  });
-
-  let recorderError: Error | null = null;
-
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  };
-  recorder.onerror = () => {
-    recorderError = new Error("MediaRecorder 编码出错");
-  };
-  recorder.start(); // 开始录制
-
-  // 获取视频轨道用于手动请求帧
-  const videoTrack = stream.getVideoTracks()[0];
-
-  return {
-    encodeFrame() {
-      // 请求 captureStream 捕获当前 canvas 内容
-      // CanvasCaptureMediaStreamTrack 有 requestFrame() 方法
-      if (videoTrack && "requestFrame" in videoTrack) {
-        try {
-          (videoTrack as CanvasCaptureMediaStreamTrack).requestFrame();
-        } catch {
-          // 某些浏览器不支持 requestFrame，依赖自动捕获
-        }
-      }
-    },
-    cancel() {
-      if (recorder.state !== "inactive") {
-        recorder.stop();
-      }
-    },
-    checkError() {
-      if (recorderError) throw recorderError;
-    },
-    async finalize() {
-      return new Promise<string>((resolve, reject) => {
-        recorder.onstop = () => {
-          const blob = new Blob(chunks, { type: selectedMime });
-          resolve(URL.createObjectURL(blob));
-        };
-        recorder.onerror = () => reject(new Error("MediaRecorder finalize 出错"));
-        if (recorder.state !== "inactive") {
-          recorder.stop();
-        } else {
-          // 已经停止了，直接返回
-          const blob = new Blob(chunks, { type: selectedMime });
-          resolve(URL.createObjectURL(blob));
-        }
-      });
-    },
-  };
-}
-
 /**
- * 根据环境自动选择编码后端
- * @param canvas - 用于 MediaRecorder fallback 时的 canvas 引用
+ * 创建 WebCodecs 编码后端
+ * 强制使用 WebCodecs (VideoEncoder + mp4-muxer) 导出 MP4
+ * 需要安全上下文（HTTPS 或 localhost）
  */
 function createEncoder(
-  _canvas: HTMLCanvasElement, // TODO: 恢复自动选择后改回 canvas
+  _canvas: HTMLCanvasElement,
   width: number,
   height: number,
   fps: number,
   bitrate: number,
 ): EncoderBackend {
-  // TODO: 排查完毕后恢复自动选择逻辑
-  // 强制使用 WebCodecs 编码后端 (MP4) 方便排查格式和时间戳问题
-  if (!isWebCodecsAvailable()) {
+  if (typeof VideoEncoder !== "function" || typeof VideoFrame !== "function") {
     throw new Error(
-      "[VideoExporter] WebCodecs 不可用（需要安全上下文 HTTPS 或 localhost），无法导出 MP4",
+      "[VideoExporter] WebCodecs 不可用（需要安全上下文 HTTPS 或 localhost），无法导出视频",
     );
   }
-  console.log("[VideoExporter] 强制使用 WebCodecs 编码后端 (MP4)");
+  console.log("[VideoExporter] 使用 WebCodecs 编码后端 (MP4)");
   return createWebCodecsBackend(width, height, fps, bitrate);
 }
 
@@ -774,7 +684,7 @@ export async function exportTrackedVideo(
   canvas.height = config.height;
   const ctx = canvas.getContext("2d")!;
 
-  // =========== 编码后端（自动选择 WebCodecs 或 MediaRecorder）===========
+  // =========== 编码后端（WebCodecs + mp4-muxer）===========
   const encoder = createEncoder(canvas, config.width, config.height, config.fps, config.videoBitrate);
 
   // =========== 阶段1：预扫描关键帧视口（AI 推理降频）===========
@@ -1159,7 +1069,7 @@ export async function exportDebugVideo(
   canvas.height = finalH;
   const ctx = canvas.getContext("2d")!;
 
-  // 初始化编码后端（自动选择 WebCodecs 或 MediaRecorder）
+  // 初始化编码后端（WebCodecs + mp4-muxer）
   const areaRatio = (finalW * finalH) / (config.width * config.height);
   const adjustedBitrate = Math.round(config.videoBitrate * areaRatio * 1.2);
   const encoder = createEncoder(canvas, finalW, finalH, config.fps, adjustedBitrate);
