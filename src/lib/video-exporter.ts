@@ -155,12 +155,228 @@ export function computeExportDimensions(
   return { width: w, height: h };
 }
 
+// =========== 编码后端抽象层 ===========
+// 优先使用 WebCodecs (VideoEncoder + mp4-muxer)，当不可用时回退到 MediaRecorder
+
+/** 检测 WebCodecs VideoEncoder 是否可用（Chrome 要求安全上下文） */
+function isWebCodecsAvailable(): boolean {
+  return typeof VideoEncoder === "function" && typeof VideoFrame === "function";
+}
+
+/**
+ * 编码后端统一接口
+ * - WebCodecs 后端：精确控帧、时间戳精准、输出 MP4
+ * - MediaRecorder 后端：兼容性好、HTTP 下也可用、输出 WebM
+ */
+interface EncoderBackend {
+  /** 编码一帧（canvas 当前内容） */
+  encodeFrame(canvas: HTMLCanvasElement, frameIndex: number, isKeyFrame: boolean): void;
+  /** 取消并关闭编码器 */
+  cancel(): void;
+  /** 检查是否有编码错误 */
+  checkError(): void;
+  /** 完成编码，返回 Blob URL */
+  finalize(): Promise<string>;
+}
+
+/** 创建 WebCodecs 编码后端 (MP4) */
+function createWebCodecsBackend(
+  width: number,
+  height: number,
+  fps: number,
+  bitrate: number,
+): EncoderBackend {
+  // 精确计算每帧时长（微秒），使用整数运算避免浮点漂移
+  const frameDurationUs = Math.round(1_000_000 / fps);
+
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: "avc", width, height },
+    fastStart: "in-memory",
+    // "strict" 要求时间戳从 0 开始且单调递增，生成更规范的 MP4
+    // QuickTime (Mac) 对 MP4 合规性要求严格，offset 模式容易出问题
+    firstTimestampBehavior: "strict",
+  });
+
+  let encoderError: Error | null = null;
+
+  const videoEncoder = new VideoEncoder({
+    output: (chunk, meta) => {
+      muxer.addVideoChunk(chunk, meta ?? undefined);
+    },
+    error: (e) => {
+      encoderError = e;
+    },
+  });
+
+  // H.264 High Profile — 根据分辨率动态选择 Level：
+  //   Level 4.0 (640028): max coded area  2,097,152 (e.g. 1920×1088) — Mac 兼容性最好
+  //   Level 4.2 (64002A): max coded area  2,228,224 (e.g. 2048×1088)
+  //   Level 5.0 (640032): max coded area  5,652,480 (e.g. 2560×1920)
+  //   Level 5.1 (640033): max coded area  9,437,184 (e.g. 4096×2304)
+  // 优先用低 Level 保证 Mac QuickTime 兼容，分辨率超限时自动升级
+  const codedArea = width * height;
+  let avcLevel: string;
+  if (codedArea <= 2_097_152) {
+    avcLevel = "avc1.640028"; // Level 4.0
+  } else if (codedArea <= 2_228_224) {
+    avcLevel = "avc1.64002A"; // Level 4.2
+  } else if (codedArea <= 5_652_480) {
+    avcLevel = "avc1.640032"; // Level 5.0
+  } else {
+    avcLevel = "avc1.640033"; // Level 5.1
+  }
+  console.log(
+    `[VideoExporter] 分辨率 ${width}×${height} (${codedArea}px²), 使用 codec: ${avcLevel}`,
+  );
+
+  videoEncoder.configure({
+    codec: avcLevel,
+    width,
+    height,
+    bitrate,
+    framerate: fps,
+  });
+
+  return {
+    encodeFrame(canvas, frameIndex, isKeyFrame) {
+      // 时间戳从 0 开始，严格按帧序号 × 帧时长计算
+      const timestampUs = frameIndex * frameDurationUs;
+      const frame = new VideoFrame(canvas, {
+        timestamp: timestampUs,
+        duration: frameDurationUs,
+      });
+      videoEncoder.encode(frame, { keyFrame: isKeyFrame });
+      frame.close();
+    },
+    cancel() {
+      videoEncoder.close();
+    },
+    checkError() {
+      if (encoderError) throw encoderError;
+    },
+    async finalize() {
+      await videoEncoder.flush();
+      videoEncoder.close();
+      muxer.finalize();
+      const { buffer } = muxer.target as ArrayBufferTarget;
+      const blob = new Blob([buffer], { type: "video/mp4" });
+      return URL.createObjectURL(blob);
+    },
+  };
+}
+
+/** 创建 MediaRecorder 编码后端 (WebM) — 不依赖 WebCodecs，HTTP 下也可用 */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function createMediaRecorderBackend(
+  canvas: HTMLCanvasElement,
+  _fps: number,
+  bitrate: number,
+): EncoderBackend {
+  const stream = canvas.captureStream(0); // fps=0 表示手动控帧
+  const chunks: Blob[] = [];
+
+  // 选择可用的 MIME 类型
+  const mimeTypes = [
+    "video/webm;codecs=h264",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+  ];
+  let selectedMime = "video/webm";
+  for (const mime of mimeTypes) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      selectedMime = mime;
+      break;
+    }
+  }
+
+  const recorder = new MediaRecorder(stream, {
+    mimeType: selectedMime,
+    videoBitsPerSecond: bitrate,
+  });
+
+  let recorderError: Error | null = null;
+
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+  recorder.onerror = () => {
+    recorderError = new Error("MediaRecorder 编码出错");
+  };
+  recorder.start(); // 开始录制
+
+  // 获取视频轨道用于手动请求帧
+  const videoTrack = stream.getVideoTracks()[0];
+
+  return {
+    encodeFrame() {
+      // 请求 captureStream 捕获当前 canvas 内容
+      // CanvasCaptureMediaStreamTrack 有 requestFrame() 方法
+      if (videoTrack && "requestFrame" in videoTrack) {
+        try {
+          (videoTrack as CanvasCaptureMediaStreamTrack).requestFrame();
+        } catch {
+          // 某些浏览器不支持 requestFrame，依赖自动捕获
+        }
+      }
+    },
+    cancel() {
+      if (recorder.state !== "inactive") {
+        recorder.stop();
+      }
+    },
+    checkError() {
+      if (recorderError) throw recorderError;
+    },
+    async finalize() {
+      return new Promise<string>((resolve, reject) => {
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: selectedMime });
+          resolve(URL.createObjectURL(blob));
+        };
+        recorder.onerror = () => reject(new Error("MediaRecorder finalize 出错"));
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        } else {
+          // 已经停止了，直接返回
+          const blob = new Blob(chunks, { type: selectedMime });
+          resolve(URL.createObjectURL(blob));
+        }
+      });
+    },
+  };
+}
+
+/**
+ * 根据环境自动选择编码后端
+ * @param canvas - 用于 MediaRecorder fallback 时的 canvas 引用
+ */
+function createEncoder(
+  _canvas: HTMLCanvasElement, // TODO: 恢复自动选择后改回 canvas
+  width: number,
+  height: number,
+  fps: number,
+  bitrate: number,
+): EncoderBackend {
+  // TODO: 排查完毕后恢复自动选择逻辑
+  // 强制使用 WebCodecs 编码后端 (MP4) 方便排查格式和时间戳问题
+  if (!isWebCodecsAvailable()) {
+    throw new Error(
+      "[VideoExporter] WebCodecs 不可用（需要安全上下文 HTTPS 或 localhost），无法导出 MP4",
+    );
+  }
+  console.log("[VideoExporter] 强制使用 WebCodecs 编码后端 (MP4)");
+  return createWebCodecsBackend(width, height, fps, bitrate);
+}
+
 /** AI 推理频率 (每秒多少帧做推理，其余帧插值) */
 const AI_INFERENCE_FPS = 5;
 
 type Viewport = { x: number; y: number; width: number; height: number };
 
 /** Hermite smoothstep: 0 处和 1 处导数为 0，过渡更自然 */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function smoothstep(t: number): number {
   t = Math.max(0, Math.min(1, t));
   return t * t * (3 - 2 * t);
@@ -403,6 +619,7 @@ function planViewportsGlobally(
 /**
  * 简单高斯平滑（用于不需要智能规划的场景，如调试视频中的原始叠加层）
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function smoothKeyframes(
   keyframes: { time: number; viewport: Viewport }[],
   windowSize: number = 5,
@@ -557,36 +774,8 @@ export async function exportTrackedVideo(
   canvas.height = config.height;
   const ctx = canvas.getContext("2d")!;
 
-  // =========== 使用 WebCodecs + mp4-muxer 精确控帧 ===========
-  // 关键：每帧的时间戳由我们手动计算（微秒），完全不受 seek 耗时影响
-  const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
-    video: {
-      codec: "avc",
-      width: config.width,
-      height: config.height,
-    },
-    fastStart: "in-memory",
-    firstTimestampBehavior: "offset",
-  });
-
-  let encoderError: Error | null = null;
-  const videoEncoder = new VideoEncoder({
-    output: (chunk, meta) => {
-      muxer.addVideoChunk(chunk, meta ?? undefined);
-    },
-    error: (e) => {
-      encoderError = e;
-    },
-  });
-
-  videoEncoder.configure({
-    codec: "avc1.640033", // H.264 High Profile Level 5.1 — 支持 4K 分辨率
-    width: config.width,
-    height: config.height,
-    bitrate: config.videoBitrate,
-    framerate: config.fps,
-  });
+  // =========== 编码后端（自动选择 WebCodecs 或 MediaRecorder）===========
+  const encoder = createEncoder(canvas, config.width, config.height, config.fps, config.videoBitrate);
 
   // =========== 阶段1：预扫描关键帧视口（AI 推理降频）===========
   report({
@@ -645,7 +834,8 @@ export async function exportTrackedVideo(
 
   // =========== 阶段2：逐帧绘制（用插值视口）===========
   const frameInterval = 1 / config.fps;
-  const frameDurationUs = Math.round(1_000_000 / config.fps); // 每帧时长（微秒）
+  // 用精确帧数控制循环，避免浮点累加漂移导致多编码帧
+  const totalFrames = Math.round(totalDuration * config.fps);
 
   video.currentTime = trimStart;
   await waitForSeek(video);
@@ -658,16 +848,17 @@ export async function exportTrackedVideo(
     duration: totalDuration,
   });
 
-  let currentExportTime = trimStart;
   let kfIdx = 0; // 当前关键帧索引
-  let frameIndex = 0; // 帧计数器，用于精确计算时间戳
 
-  while (currentExportTime <= trimEnd) {
+  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
     if (abortSignal?.aborted) {
-      videoEncoder.close();
+      encoder.cancel();
       throw new Error("导出已取消");
     }
-    if (encoderError) throw encoderError;
+    encoder.checkError();
+
+    // 通过帧序号精确计算当前时间点，避免浮点累加误差
+    const currentExportTime = trimStart + frameIndex * frameInterval;
 
     // Seek 到目标帧
     video.currentTime = currentExportTime;
@@ -698,19 +889,9 @@ export async function exportTrackedVideo(
     ctx.clearRect(0, 0, config.width, config.height);
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, config.width, config.height);
 
-    // 核心：用精确的时间戳创建 VideoFrame，完全不受 seek 耗时影响
-    const timestampUs = frameIndex * frameDurationUs;
-    const frame = new VideoFrame(canvas, {
-      timestamp: timestampUs,
-      duration: frameDurationUs,
-    });
-
-    // 每 2 秒插入一个关键帧，其余为 delta 帧
+    // 通过编码后端编码当前帧
     const isKeyFrame = frameIndex % (config.fps * 2) === 0;
-    videoEncoder.encode(frame, { keyFrame: isKeyFrame });
-    frame.close();
-
-    frameIndex++;
+    encoder.encodeFrame(canvas, frameIndex, isKeyFrame);
 
     // 更新进度
     const elapsed = currentExportTime - trimStart;
@@ -723,8 +904,6 @@ export async function exportTrackedVideo(
       currentTime: elapsed,
       duration: totalDuration,
     });
-
-    currentExportTime += frameInterval;
 
     // 给主线程喘息机会（每3帧一次）
     if (frameIndex % 3 === 0) {
@@ -739,14 +918,7 @@ export async function exportTrackedVideo(
     message: "正在合成视频文件...",
   });
 
-  await videoEncoder.flush();
-  videoEncoder.close();
-  muxer.finalize();
-
-  // 从 ArrayBufferTarget 获取最终的 MP4 二进制数据
-  const { buffer } = muxer.target as ArrayBufferTarget;
-  const blob = new Blob([buffer], { type: "video/mp4" });
-  const url = URL.createObjectURL(blob);
+  const url = await encoder.finalize();
 
   report({
     phase: "done",
@@ -932,7 +1104,7 @@ export async function exportDebugVideo(
     bottomH = Math.round(bottomW / sourceAr); // 全景按源视频宽高比
 
     let totalH = topH + gap + bottomH;
-    let totalArea = topW * totalH;
+    const totalArea = topW * totalH;
 
     if (totalArea > MAX_CODED_AREA) {
       const scale = Math.sqrt(MAX_CODED_AREA / totalArea);
@@ -958,7 +1130,7 @@ export async function exportDebugVideo(
     bottomW = Math.round(topH * sourceAr);
 
     let totalW = topW + gap + bottomW;
-    let totalArea = totalW * topH;
+    const totalArea = totalW * topH;
 
     if (totalArea > MAX_CODED_AREA) {
       const scale = Math.sqrt(MAX_CODED_AREA / totalArea);
@@ -987,39 +1159,10 @@ export async function exportDebugVideo(
   canvas.height = finalH;
   const ctx = canvas.getContext("2d")!;
 
-  // 初始化编码器
-  const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
-    video: {
-      codec: "avc",
-      width: finalW,
-      height: finalH,
-    },
-    fastStart: "in-memory",
-    firstTimestampBehavior: "offset",
-  });
-
-  let encoderError: Error | null = null;
-  const videoEncoder = new VideoEncoder({
-    output: (chunk, meta) => {
-      muxer.addVideoChunk(chunk, meta ?? undefined);
-    },
-    error: (e) => {
-      encoderError = e;
-    },
-  });
-
-  // 适当提高码率以容纳更大的画面
+  // 初始化编码后端（自动选择 WebCodecs 或 MediaRecorder）
   const areaRatio = (finalW * finalH) / (config.width * config.height);
   const adjustedBitrate = Math.round(config.videoBitrate * areaRatio * 1.2);
-
-  videoEncoder.configure({
-    codec: "avc1.640033",
-    width: finalW,
-    height: finalH,
-    bitrate: adjustedBitrate,
-    framerate: config.fps,
-  });
+  const encoder = createEncoder(canvas, finalW, finalH, config.fps, adjustedBitrate);
 
   // =========== 阶段1：预扫描关键帧 ===========
   report({
@@ -1087,7 +1230,8 @@ export async function exportDebugVideo(
 
   // =========== 阶段2：逐帧绘制 ===========
   const frameInterval = 1 / config.fps;
-  const frameDurationUs = Math.round(1_000_000 / config.fps);
+  // 用精确帧数控制循环，避免浮点累加漂移导致多编码帧
+  const totalFrames = Math.round(totalDuration * config.fps);
 
   video.currentTime = trimStart;
   await waitForSeek(video);
@@ -1100,16 +1244,17 @@ export async function exportDebugVideo(
     duration: totalDuration,
   });
 
-  let currentExportTime = trimStart;
   let kfIdx = 0;
-  let frameIndex = 0;
 
-  while (currentExportTime <= trimEnd) {
+  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
     if (abortSignal?.aborted) {
-      videoEncoder.close();
+      encoder.cancel();
       throw new Error("导出已取消");
     }
-    if (encoderError) throw encoderError;
+    encoder.checkError();
+
+    // 通过帧序号精确计算当前时间点，避免浮点累加误差
+    const currentExportTime = trimStart + frameIndex * frameInterval;
 
     video.currentTime = currentExportTime;
     await waitForSeek(video);
@@ -1212,18 +1357,9 @@ export async function exportDebugVideo(
       ctx.fillText("DEBUG", rightX + 6, Math.round(bottomH * 0.025));
     }
 
-    // 创建帧并编码
-    const timestampUs = frameIndex * frameDurationUs;
-    const frame = new VideoFrame(canvas, {
-      timestamp: timestampUs,
-      duration: frameDurationUs,
-    });
-
+    // 通过编码后端编码当前帧
     const isKeyFrame = frameIndex % (config.fps * 2) === 0;
-    videoEncoder.encode(frame, { keyFrame: isKeyFrame });
-    frame.close();
-
-    frameIndex++;
+    encoder.encodeFrame(canvas, frameIndex, isKeyFrame);
 
     const elapsed = currentExportTime - trimStart;
     const progress = 0.45 + Math.min(0.5, (elapsed / totalDuration) * 0.5);
@@ -1236,7 +1372,6 @@ export async function exportDebugVideo(
       duration: totalDuration,
     });
 
-    currentExportTime += frameInterval;
     if (frameIndex % 3 === 0) await sleep(0);
   }
 
@@ -1247,13 +1382,7 @@ export async function exportDebugVideo(
     message: "正在合成调试视频文件...",
   });
 
-  await videoEncoder.flush();
-  videoEncoder.close();
-  muxer.finalize();
-
-  const { buffer } = muxer.target as ArrayBufferTarget;
-  const blob = new Blob([buffer], { type: "video/mp4" });
-  const url = URL.createObjectURL(blob);
+  const url = await encoder.finalize();
 
   report({
     phase: "done",
