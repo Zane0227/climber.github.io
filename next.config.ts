@@ -1,12 +1,7 @@
 import type { NextConfig } from "next";
 
-const isProd = process.env.NODE_ENV === "production";
-
 const nextConfig: NextConfig = {
   output: "export",
-  // GitHub Pages 部署在 https://zane0227.github.io/climber/ 子路径下
-  basePath: isProd ? "/climber" : "",
-  assetPrefix: isProd ? "/climber/" : "",
   turbopack: {},
   webpack: (config, { isServer }) => {
     if (isServer) {
